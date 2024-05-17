@@ -653,7 +653,7 @@ class EmbyReporter(_PluginBase):
                 continue
 
         if index > 0:
-            save_path = "/public/report.jpg"
+            save_path = "./public/report.jpg"
             if Path(save_path).exists():
                 Path.unlink(Path(save_path))
             bg.save(save_path)
