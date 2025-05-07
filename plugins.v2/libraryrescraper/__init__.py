@@ -116,7 +116,7 @@ class LibraryScraper(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "LibraryScraper",
+                "id": "LibraryReScraper",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.__libraryscraper,
@@ -124,7 +124,7 @@ class LibraryScraper(_PluginBase):
             }]
         elif self._enabled:
             return [{
-                "id": "LibraryScraper",
+                "id": "LibraryReScraper",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab("0 0 */7 * *"),
                 "func": self.__libraryscraper,
