@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Union
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -10,18 +10,22 @@ from apscheduler.triggers.cron import CronTrigger
 from app import schemas
 from app.chain.media import MediaChain
 from app.core.config import settings
-from app.core.metainfo import MetaInfoPath
+from app.core.metainfo import MetaInfo,MetaInfoPath
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.nfo import NfoReader
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType
 from app.utils.system import SystemUtils
+from app.chain.storage import StorageChain
+from app.core.meta import MetaBase
+from app.core.context import Context, MediaInfo
+from app.utils.string import StringUtils
+from app.utils.http import RequestUtils
 
-
-class LibraryScraper(_PluginBase):
+class LibraryScraperOwn(_PluginBase):
     # 插件名称
-    plugin_name = "媒体库刮削"
+    plugin_name = "媒体库刮削改"
     # 插件描述
     plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片。"
     # 插件图标
@@ -29,11 +33,11 @@ class LibraryScraper(_PluginBase):
     # 插件版本
     plugin_version = "2.1.1"
     # 插件作者
-    plugin_author = "jxxghp"
+    plugin_author = "kiliter"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/kiliter"
     # 插件配置项ID前缀
-    plugin_config_prefix = "libraryscraper_"
+    plugin_config_prefix = "libraryscraperown_"
     # 加载顺序
     plugin_order = 7
     # 可使用的用户级别
@@ -45,6 +49,7 @@ class LibraryScraper(_PluginBase):
     # 限速开关
     _enabled = False
     _onlyonce = False
+    _pre_day = 7
     _cron = None
     _mode = ""
     _scraper_paths = ""
@@ -62,6 +67,8 @@ class LibraryScraper(_PluginBase):
             self._mode = config.get("mode") or ""
             self._scraper_paths = config.get("scraper_paths") or ""
             self._exclude_paths = config.get("exclude_paths") or ""
+            self._pre_day = config.get("pre_day") or 7
+            self.storagechain = StorageChain()
 
         # 停止现有任务
         self.stop_service()
@@ -113,7 +120,7 @@ class LibraryScraper(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "LibraryScraper",
+                "id": "LibraryScraperOwn",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.__libraryscraper,
@@ -121,7 +128,7 @@ class LibraryScraper(_PluginBase):
             }]
         elif self._enabled:
             return [{
-                "id": "LibraryScraper",
+                "id": "LibraryScraperOwn",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab("0 0 */7 * *"),
                 "func": self.__libraryscraper,
@@ -168,6 +175,14 @@ class LibraryScraper(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VTextField',
+                                'props': {
+                                    'model': 'pre_day',
+                                    'label': '近几天',
+                                    'placeholder': '7',
+                                }
                             }
                         ]
                     },
@@ -404,8 +419,8 @@ class LibraryScraper(_PluginBase):
                 mediainfo.title = transfer_history.title
         # 获取图片
         self.chain.obtain_images(mediainfo)
-        # 刮削
-        MediaChain().scrape_metadata(
+
+        self.scrape_metadata(
             fileitem=schemas.FileItem(
                 storage="local",
                 type="dir",
@@ -418,6 +433,314 @@ class LibraryScraper(_PluginBase):
             overwrite=True if self._mode else False
         )
         logger.info(f"{path} 刮削完成")
+
+    def scrape_metadata(self, fileitem: schemas.FileItem,
+                        meta: MetaBase = None, mediainfo: MediaInfo = None,
+                        init_folder: bool = True, parent: schemas.FileItem = None,
+                        overwrite: bool = False):
+        """
+        手动刮削媒体信息
+        :param fileitem: 刮削目录或文件
+        :param meta: 元数据
+        :param mediainfo: 媒体信息
+        :param init_folder: 是否刮削根目录
+        :param parent: 上级目录
+        :param overwrite: 是否覆盖已有文件
+        """
+
+        def is_bluray_folder(_fileitem: schemas.FileItem) -> bool:
+            """
+            判断是否为原盘目录
+            """
+            if not _fileitem or _fileitem.type != "dir":
+                return False
+            # 蓝光原盘目录必备的文件或文件夹
+            required_files = ['BDMV', 'CERTIFICATE']
+            # 检查目录下是否存在所需文件或文件夹
+            for item in self.storagechain.list_files(_fileitem):
+                if item.name in required_files:
+                    return True
+            return False
+
+        def __list_files(_fileitem: schemas.FileItem):
+            """
+            列出下级文件
+            """
+            return self.storagechain.list_files(fileitem=_fileitem)
+
+        def __save_file(_fileitem: schemas.FileItem, _path: Path, _content: Union[bytes, str]):
+            """
+            保存或上传文件
+            :param _fileitem: 关联的媒体文件项
+            :param _path: 元数据文件路径
+            :param _content: 文件内容
+            """
+            if not _fileitem or not _content or not _path:
+                return
+            # 保存文件到临时目录，文件名随机
+            tmp_file = settings.TEMP_PATH / f"{_path.name}.{StringUtils.generate_random_str(10)}"
+            tmp_file.write_bytes(_content)
+            # 获取文件的父目录
+            try:
+                item = self.storagechain.upload_file(fileitem=_fileitem, path=tmp_file, new_name=_path.name)
+                if item:
+                    logger.info(f"已保存文件：{item.path}")
+                else:
+                    logger.warn(f"文件保存失败：{_path}")
+            finally:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+
+        def __download_image(_url: str) -> Optional[bytes]:
+            """
+            下载图片并保存
+            """
+            try:
+                logger.info(f"正在下载图片：{_url} ...")
+                r = RequestUtils(proxies=settings.PROXY).get_res(url=_url)
+                if r:
+                    return r.content
+                else:
+                    logger.info(f"{_url} 图片下载失败，请检查网络连通性！")
+            except Exception as err:
+                logger.error(f"{_url} 图片下载失败：{str(err)}！")
+            return None
+
+        # 当前文件路径
+        filepath = Path(fileitem.path)
+        if fileitem.type == "file" \
+                and (not filepath.suffix or filepath.suffix.lower() not in settings.RMT_MEDIAEXT):
+            return
+        if not meta:
+            meta = MetaInfoPath(filepath)
+        if not mediainfo:
+            mediainfo = MediaChain().recognize_by_meta(meta)
+        if not mediainfo:
+            logger.warn(f"{filepath} 无法识别文件媒体信息！")
+            return
+        logger.info(f"开始刮削：{filepath} ...")
+        if mediainfo.type == MediaType.MOVIE:
+            # 电影
+            if fileitem.type == "file":
+                # 是否已存在
+                nfo_path = filepath.with_suffix(".nfo")
+                if self.__check_time_out(nfo_path, self._pre_day):
+                    logger.info(f"超过{self._pre_day}天跳过：{nfo_path}")
+                    return
+
+                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                    # 电影文件
+                    movie_nfo = MediaChain().metadata_nfo(meta=meta, mediainfo=mediainfo)
+                    if movie_nfo:
+                        # 保存或上传nfo文件到上级目录
+                        __save_file(_fileitem=parent, _path=nfo_path, _content=movie_nfo)
+                    else:
+                        logger.warn(f"{filepath.name} nfo文件生成失败！")
+                else:
+                    logger.info(f"已存在nfo文件：{nfo_path}")
+            else:
+                # 电影目录
+                if is_bluray_folder(fileitem):
+                    # 原盘目录
+                    nfo_path = filepath / (filepath.name + ".nfo")
+                    if self.__check_time_out(nfo_path, self._pre_day):
+                        logger.info(f"超过{self._pre_day}天跳过：{nfo_path}")
+                        return
+                    if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                        # 生成原盘nfo
+                        movie_nfo = MediaChain().metadata_nfo(meta=meta, mediainfo=mediainfo)
+                        if movie_nfo:
+                            # 保存或上传nfo文件到当前目录
+                            __save_file(_fileitem=fileitem, _path=nfo_path, _content=movie_nfo)
+                        else:
+                            logger.warn(f"{filepath.name} nfo文件生成失败！")
+                    else:
+                        logger.info(f"已存在nfo文件：{nfo_path}")
+                else:
+                    # 处理目录内的文件
+                    files = __list_files(_fileitem=fileitem)
+                    for file in files:
+                        self.scrape_metadata(fileitem=file,
+                                             meta=meta, mediainfo=mediainfo,
+                                             init_folder=False, parent=fileitem,
+                                             overwrite=overwrite)
+                # 生成目录内图片文件
+                if init_folder:
+                    # 图片
+                    for attr_name, attr_value in vars(mediainfo).items():
+                        if attr_value \
+                                and attr_name.endswith("_path") \
+                                and attr_value \
+                                and isinstance(attr_value, str) \
+                                and attr_value.startswith("http"):
+                            image_name = attr_name.replace("_path", "") + Path(attr_value).suffix
+                            image_path = filepath / image_name
+                            if not self.storagechain.get_file_item(storage=fileitem.storage,
+                                                                                path=image_path):
+                                # 下载图片
+                                content = __download_image(_url=attr_value)
+                                # 写入图片到当前目录
+                                if content:
+                                    __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                            else:
+                                logger.info(f"已存在图片文件：{image_path}")
+        else:
+            # 电视剧
+            if fileitem.type == "file":
+                # 重新识别季集
+                file_meta = MetaInfoPath(filepath)
+                if not file_meta.begin_episode:
+                    logger.warn(f"{filepath.name} 无法识别文件集数！")
+                    return
+                file_mediainfo = MediaChain().recognize_media(meta=file_meta, tmdbid=mediainfo.tmdb_id,
+                                                      episode_group=mediainfo.episode_group)
+                if not file_mediainfo:
+                    logger.warn(f"{filepath.name} 无法识别文件媒体信息！")
+                    return
+                # 是否已存在
+                nfo_path = filepath.with_suffix(".nfo")
+
+                if self.__check_time_out(nfo_path, self._pre_day):
+                    logger.info(f"超过{self._pre_day}天跳过：{nfo_path}")
+                    return
+
+                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                    # 获取集的nfo文件
+                    episode_nfo = MediaChain().metadata_nfo(meta=file_meta, mediainfo=file_mediainfo,
+                                                    season=file_meta.begin_season,
+                                                    episode=file_meta.begin_episode)
+                    if episode_nfo:
+                        # 保存或上传nfo文件到上级目录
+                        if not parent:
+                            parent = self.storagechain.get_parent_item(fileitem)
+                        __save_file(_fileitem=parent, _path=nfo_path, _content=episode_nfo)
+                    else:
+                        logger.warn(f"{filepath.name} nfo文件生成失败！")
+                else:
+                    logger.info(f"已存在nfo文件：{nfo_path}")
+                # 获取集的图片
+                image_dict = MediaChain().metadata_img(mediainfo=file_mediainfo,
+                                               season=file_meta.begin_season, episode=file_meta.begin_episode)
+                if image_dict:
+                    for episode, image_url in image_dict.items():
+                        image_path = filepath.with_suffix(Path(image_url).suffix)
+                        if not self.storagechain.get_file_item(storage=fileitem.storage, path=image_path):
+                            # 下载图片
+                            content = __download_image(image_url)
+                            # 保存图片文件到当前目录
+                            if content:
+                                if not parent:
+                                    parent = self.storagechain.get_parent_item(fileitem)
+                                __save_file(_fileitem=parent, _path=image_path, _content=content)
+                        else:
+                            logger.info(f"已存在图片文件：{image_path}")
+            else:
+                # 当前为目录，处理目录内的文件
+                files = __list_files(_fileitem=fileitem)
+                for file in files:
+                    self.scrape_metadata(fileitem=file,
+                                         meta=meta, mediainfo=mediainfo,
+                                         parent=fileitem if file.type == "file" else None,
+                                         init_folder=True if file.type == "dir" else False,
+                                         overwrite=overwrite)
+                # 生成目录的nfo和图片
+                if init_folder:
+                    # 识别文件夹名称
+                    season_meta = MetaInfo(filepath.name)
+                    # 当前文件夹为Specials或者SPs时，设置为S0
+                    if filepath.name in settings.RENAME_FORMAT_S0_NAMES:
+                        season_meta.begin_season = 0
+                    if season_meta.begin_season is not None:
+                        # 是否已存在
+                        nfo_path = filepath / "season.nfo"
+                        if self.__check_time_out(nfo_path, self._pre_day):
+                            logger.info(f"超过{self._pre_day}天跳过：{nfo_path}")
+                            return
+                        if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                            # 当前目录有季号，生成季nfo
+                            season_nfo = MediaChain().metadata_nfo(meta=meta, mediainfo=mediainfo,
+                                                           season=season_meta.begin_season)
+                            if season_nfo:
+                                # 写入nfo到根目录
+                                __save_file(_fileitem=fileitem, _path=nfo_path, _content=season_nfo)
+                            else:
+                                logger.warn(f"无法生成电视剧季nfo文件：{meta.name}")
+                        else:
+                            logger.info(f"已存在nfo文件：{nfo_path}")
+                        # TMDB季poster图片
+                        image_dict = MediaChain().metadata_img(mediainfo=mediainfo, season=season_meta.begin_season)
+                        if image_dict:
+                            for image_name, image_url in image_dict.items():
+                                image_path = filepath.with_name(image_name)
+                                if not self.storagechain.get_file_item(storage=fileitem.storage,
+                                                                                    path=image_path):
+                                    # 下载图片
+                                    content = __download_image(image_url)
+                                    # 保存图片文件到剧集目录
+                                    if content:
+                                        if not parent:
+                                            parent = self.storagechain.get_parent_item(fileitem)
+                                        __save_file(_fileitem=parent, _path=image_path, _content=content)
+                                else:
+                                    logger.info(f"已存在图片文件：{image_path}")
+                        # 额外fanart季图片：poster thumb banner
+                        image_dict = MediaChain().metadata_img(mediainfo=mediainfo)
+                        if image_dict:
+                            for image_name, image_url in image_dict.items():
+                                if image_name.startswith("season"):
+                                    image_path = filepath.with_name(image_name)
+                                    # 只下载当前刮削季的图片
+                                    image_season = "00" if "specials" in image_name else image_name[6:8]
+                                    if image_season != str(season_meta.begin_season).rjust(2, '0'):
+                                        logger.info(f"当前刮削季为：{season_meta.begin_season}，跳过文件：{image_path}")
+                                        continue
+                                    if not self.storagechain.get_file_item(storage=fileitem.storage,
+                                                                                        path=image_path):
+                                        # 下载图片
+                                        content = __download_image(image_url)
+                                        # 保存图片文件到当前目录
+                                        if content:
+                                            if not parent:
+                                                parent = self.storagechain.get_parent_item(fileitem)
+                                            __save_file(_fileitem=parent, _path=image_path, _content=content)
+                                    else:
+                                        logger.info(f"已存在图片文件：{image_path}")
+                    # 判断当前目录是不是剧集根目录
+                    if not season_meta.season:
+                        # 是否已存在
+                        nfo_path = filepath / "tvshow.nfo"
+                        if self.__check_time_out(nfo_path, self._pre_day):
+                            logger.info(f"超过{self._pre_day}天跳过：{nfo_path}")
+                            return
+                        if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                            # 当前目录有名称，生成tvshow nfo 和 tv图片
+                            tv_nfo = MediaChain().metadata_nfo(meta=meta, mediainfo=mediainfo)
+                            if tv_nfo:
+                                # 写入tvshow nfo到根目录
+                                __save_file(_fileitem=fileitem, _path=nfo_path, _content=tv_nfo)
+                            else:
+                                logger.warn(f"无法生成电视剧nfo文件：{meta.name}")
+                        else:
+                            logger.info(f"已存在nfo文件：{nfo_path}")
+                        # 生成目录图片
+                        image_dict = MediaChain().metadata_img(mediainfo=mediainfo)
+                        if image_dict:
+                            for image_name, image_url in image_dict.items():
+                                # 不下载季图片
+                                if image_name.startswith("season"):
+                                    continue
+                                image_path = filepath / image_name
+                                if not self.storagechain.get_file_item(storage=fileitem.storage,
+                                                                                    path=image_path):
+                                    # 下载图片
+                                    content = __download_image(image_url)
+                                    # 保存图片文件到当前目录
+                                    if content:
+                                        __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                                else:
+                                    logger.info(f"已存在图片文件：{image_path}")
+        logger.info(f"{filepath.name} 刮削完成")
+
 
     @staticmethod
     def __get_tmdbid_from_nfo(file_path: Path):
@@ -442,6 +765,32 @@ class LibraryScraper(_PluginBase):
                     return tmdbid
         except Exception as err:
             logger.warn(f"从nfo文件中获取tmdbid失败：{str(err)}")
+        return None
+
+    @staticmethod
+    def __check_time_out(file_path: Path, pre_day: int):
+        """
+        从nfo文件中获取信息
+        :param file_path:
+        :return: dateadded
+        """
+        if not file_path:
+            return None
+        xpaths = [
+            "dateadded"
+        ]
+        try:
+            reader = NfoReader(file_path)
+            for xpath in xpaths:
+                dateadded = reader.get_element_value(xpath)
+                if dateadded:
+                    target_time = datetime.strptime(dateadded, "%Y-%m-%d %H:%M:%S")
+                    now = datetime.now()
+                    seven_days_ago = now - timedelta(days=pre_day)
+                    # 超过7天前，返回True，否则返回False
+                    return target_time < seven_days_ago
+        except Exception as err:
+            logger.warn(f"从nfo文件中获取dateadded失败：{str(err)}")
         return None
 
     def stop_service(self):
